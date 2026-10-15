@@ -11,31 +11,56 @@ const {
 const TOKEN = process.env.DISCORD_TOKEN;
 const PREFIX = "!";
 const STATE_FILE = path.join(__dirname, "state.json");
+const READY_TIMEOUT_MS = 20000;
+const REJOIN_DELAY_MS = 5000;
 
 if (!TOKEN) {
   console.error("DISCORD_TOKEN kosong di .env");
   process.exit(1);
 }
 
+const state = loadState();
 const connections = new Map();
 const rejoining = new Set();
+const joinChains = new Map();
 
 function loadState() {
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) || {};
+    const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const clean = {};
+    for (const [guildId, s] of Object.entries(parsed)) {
+      if (s && typeof s.channelId === "string") {
+        clean[guildId] = {
+          channelId: s.channelId,
+          joinedAt: Number.isFinite(s.joinedAt) ? s.joinedAt : Date.now(),
+        };
+      }
+    }
+    return clean;
   } catch {
     return {};
   }
 }
 
-const state = loadState();
-
 function saveState() {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  try {
+    const tmp = `${STATE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, STATE_FILE);
+  } catch (e) {
+    console.error("[state] gagal simpan state.json", e);
+  }
+}
+
+function removeGuildState(guildId) {
+  if (!(guildId in state)) return;
+  delete state[guildId];
+  saveState();
 }
 
 function formatDuration(ms) {
-  const total = Math.max(0, Math.floor(ms / 1000));
+  const total = Math.max(0, Math.floor((Number.isFinite(ms) ? ms : 0) / 1000));
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
   const s = total % 60;
@@ -62,20 +87,19 @@ let client = null;
 
 function destroyConnection(guildId) {
   const conn = connections.get(guildId);
-  if (!conn) return;
   connections.delete(guildId);
+  if (!conn) return;
   conn.removeAllListeners();
   try {
     conn.destroy();
   } catch {}
 }
 
-async function joinGuild(guild, channelId) {
+async function doJoinGuild(guild, channelId) {
   const channel = guild.channels.cache.get(channelId);
   if (!channel || !channel.isVoiceBased()) {
-    console.log(`[voice] channel ${channelId} hilang di ${guild.name}, stop auto rejoin`);
-    delete state[guild.id];
-    saveState();
+    console.log(`[voice:${guild.id}] channel ${channelId} hilang, stop auto rejoin`);
+    removeGuildState(guild.id);
     destroyConnection(guild.id);
     return false;
   }
@@ -95,48 +119,70 @@ async function joinGuild(guild, channelId) {
     return false;
   }
 
-  connection.on(VoiceConnectionStatus.Disconnected, () => onDisconnected(guild.id));
+  connection.on(VoiceConnectionStatus.Disconnected, (_, __, code) =>
+    onDisconnected(guild.id, channel.id, code)
+  );
   connection.on("error", (e) => console.error(`[voice:${guild.id}] connection error`, e));
   connections.set(guild.id, connection);
 
   try {
-    await entersState(connection, VoiceConnectionStatus.Ready, 15000);
+    await entersState(connection, VoiceConnectionStatus.Ready, READY_TIMEOUT_MS);
   } catch (e) {
     console.error(`[voice:${guild.id}] gagal ready`, e?.message ?? e);
+    if (connections.get(guild.id) === connection) destroyConnection(guild.id);
     return false;
   }
 
-  if (!state[guild.id]) {
-    state[guild.id] = { channelId: channel.id, joinedAt: Date.now() };
-    saveState();
-  }
-  console.log(`[voice:${guild.id}] masuk **${channel.name}**`);
+  const prev = state[guild.id];
+  state[guild.id] = {
+    channelId: channel.id,
+    joinedAt: prev?.joinedAt ?? Date.now(),
+  };
+  saveState();
+  console.log(`[voice:${guild.id}] masuk ${channel.name}`);
   return true;
 }
 
-function onDisconnected(guildId) {
-  if (!state[guildId]) return;
-  console.log(`[voice:${guildId}] terputus, auto rejoin dalam 5 detik`);
+function joinGuild(guild, channelId) {
+  const prev = joinChains.get(guild.id) ?? Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(() => doJoinGuild(guild, channelId));
+  joinChains.set(guild.id, next.catch(() => {}));
+  return next;
+}
+
+function onDisconnected(guildId, channelId, code) {
+  const s = state[guildId];
+  if (!s || s.channelId !== channelId) return;
+  console.log(`[voice:${guildId}] terputus (code=${code ?? "?"}), auto rejoin...`);
   scheduleRejoin(guildId);
 }
 
 async function scheduleRejoin(guildId) {
   if (rejoining.has(guildId)) return;
   rejoining.add(guildId);
-  while (state[guildId]) {
-    await sleep(5000);
-    if (!state[guildId]) break;
-    const conn = connections.get(guildId);
-    if (conn && conn.state.status === VoiceConnectionStatus.Ready) break;
-    const guild = client.guilds.cache.get(guildId);
-    if (!guild) break;
-    console.log(`[voice:${guildId}] coba rejoin...`);
-    if (await joinGuild(guild, state[guildId].channelId)) break;
+  try {
+    while (state[guildId]) {
+      await sleep(REJOIN_DELAY_MS);
+      if (!state[guildId]) break;
+      const conn = connections.get(guildId);
+      if (conn && conn.state.status === VoiceConnectionStatus.Ready) break;
+      const guild = client?.guilds?.cache?.get(guildId);
+      if (!guild) break;
+      console.log(`[voice:${guildId}] coba rejoin...`);
+      if (await joinGuild(guild, state[guildId].channelId)) break;
+    }
+  } finally {
+    rejoining.delete(guildId);
   }
-  rejoining.delete(guildId);
 }
 
 async function doJoin(guild, channel, reply) {
+  if (!guild) {
+    await reply("Command ini cuma bisa dipake di dalam server.");
+    return;
+  }
   if (!channel || !channel.isVoiceBased()) {
     await reply("Masuk voice channel dulu, baru jalanin command ini.");
     return;
@@ -154,9 +200,12 @@ async function doJoin(guild, channel, reply) {
 }
 
 async function doLeave(guild, reply) {
+  if (!guild) {
+    await reply("Command ini cuma bisa dipake di dalam server.");
+    return;
+  }
   const s = state[guild.id];
-  delete state[guild.id];
-  saveState();
+  removeGuildState(guild.id);
   destroyConnection(guild.id);
   if (s) {
     await reply(`Dikeluarin dengan baik. Durasi numpuk: **${formatDuration(Date.now() - s.joinedAt)}**`);
@@ -166,6 +215,10 @@ async function doLeave(guild, reply) {
 }
 
 async function doStatus(guild, reply) {
+  if (!guild) {
+    await reply("Command ini cuma bisa dipake di dalam server.");
+    return;
+  }
   const s = state[guild.id];
   if (!s) {
     await reply("Belum ada sesi voice. Jalanin `!join` atau `/join` dulu.");
@@ -189,6 +242,8 @@ function createClient(intents) {
   const c = new Client({ intents });
   client = c;
 
+  c.on("error", (e) => console.error("client error", e));
+
   c.once("clientReady", async () => {
     console.log(`Logged in sebagai ${c.user.tag} (prefix: ${intents === SAFE_INTENTS ? "OFF, slash-only" : "ON"})`);
     c.user.setActivity(`/join buat numpuk jam`);
@@ -202,25 +257,38 @@ function createClient(intents) {
       console.error("Gagal daftar slash commands", e);
     }
 
-    for (const [guildId, s] of Object.entries(state)) {
-      const guild = c.guilds.cache.get(guildId);
+    for (const guildId of Object.keys(state)) {
+      let guild = c.guilds.cache.get(guildId);
       if (!guild) {
-        delete state[guildId];
+        try {
+          guild = await c.guilds.fetch(guildId);
+        } catch {
+          guild = null;
+        }
+      }
+      if (!guild) {
+        console.log(`[state] guild ${guildId} gak ketemu, buang dari state`);
+        removeGuildState(guildId);
         continue;
       }
-      const ok = await joinGuild(guild, s.channelId);
+      const ok = await joinGuild(guild, state[guildId].channelId);
       if (!ok) scheduleRejoin(guildId);
     }
     saveState();
   });
 
+  c.on("guildDelete", (guild) => {
+    removeGuildState(guild.id);
+    destroyConnection(guild.id);
+  });
+
   c.on("messageCreate", async (msg) => {
-    if (msg.author.bot || !msg.inGuild()) return;
+    if (msg.author.bot || !msg.inGuild() || !msg.member) return;
     if (!msg.content.startsWith(PREFIX)) return;
     const [cmd] = msg.content.slice(PREFIX.length).trim().split(/\s+/);
     const name = (cmd || "").toLowerCase();
     const reply = (t) => msg.reply(t);
-    if (name === "join") await doJoin(msg.guild, msg.member?.voice?.channel, reply);
+    if (name === "join") await doJoin(msg.guild, msg.member.voice?.channel, reply);
     else if (name === "leave") await doLeave(msg.guild, reply);
     else if (name === "status") await doStatus(msg.guild, reply);
   });
@@ -228,25 +296,25 @@ function createClient(intents) {
   c.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     const reply = (t) => interaction.reply(t);
-    if (interaction.commandName === "join") {
-      await doJoin(interaction.guild, interaction.member?.voice?.channel, reply);
-    } else if (interaction.commandName === "leave") {
-      await doLeave(interaction.guild, reply);
-    } else if (interaction.commandName === "status") {
-      await doStatus(interaction.guild, reply);
-    }
+    const channel = interaction.guild
+      ? interaction.guild.channels.cache.get(interaction.member?.voice?.channelId)
+      : null;
+    if (interaction.commandName === "join") await doJoin(interaction.guild, channel, reply);
+    else if (interaction.commandName === "leave") await doLeave(interaction.guild, reply);
+    else if (interaction.commandName === "status") await doStatus(interaction.guild, reply);
   });
 
   c.on("voiceStateUpdate", (oldState, newState) => {
     const member = newState.member ?? oldState.member;
     if (!member || member.id !== c.user.id) return;
-    const s = state[member.guild.id];
+    const guildId = member.guild.id;
+    const s = state[guildId];
     if (!s) return;
-    const current = newState.channelId ?? oldState.channelId;
-    if (current && current !== s.channelId && !rejoining.has(member.guild.id)) {
-      console.log(`[voice:${member.guild.id}] bot dipindah, balik ke channel target`);
+    const newChannelId = newState.channelId;
+    if (newChannelId && newChannelId !== s.channelId) {
+      console.log(`[voice:${guildId}] bot dipindah ke ${newChannelId}, balik ke target`);
       joinGuild(member.guild, s.channelId).then((ok) => {
-        if (!ok) scheduleRejoin(member.guild.id);
+        if (!ok) scheduleRejoin(guildId);
       });
     }
   });
@@ -273,7 +341,20 @@ function start(intents) {
   });
 }
 
-start(FULL_INTENTS);
+function shutdown(signal) {
+  console.log(`[shutdown] ${signal}, simpan state & putus voice`);
+  saveState();
+  for (const guildId of [...connections.keys()]) destroyConnection(guildId);
+  process.exit(0);
+}
 
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
-process.on("uncaughtException", (e) => console.error("uncaughtException", e));
+process.on("uncaughtException", (e) => {
+  console.error("uncaughtException", e);
+  saveState();
+  process.exit(1);
+});
+
+start(FULL_INTENTS);
