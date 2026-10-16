@@ -13,6 +13,7 @@ const PREFIX = "!";
 const STATE_FILE = path.join(__dirname, "state.json");
 const READY_TIMEOUT_MS = 20000;
 const REJOIN_DELAY_MS = 5000;
+const UNKNOWN_GUILD = 10004;
 
 if (!TOKEN) {
   console.error("DISCORD_TOKEN kosong di .env");
@@ -23,6 +24,8 @@ const state = loadState();
 const connections = new Map();
 const rejoining = new Set();
 const joinChains = new Map();
+
+let client = null;
 
 function loadState() {
   try {
@@ -53,6 +56,15 @@ function saveState() {
   }
 }
 
+function setTarget(guildId, channelId) {
+  const prev = state[guildId];
+  state[guildId] = {
+    channelId,
+    joinedAt: Number.isFinite(prev?.joinedAt) ? prev.joinedAt : Date.now(),
+  };
+  saveState();
+}
+
 function removeGuildState(guildId) {
   if (!(guildId in state)) return;
   delete state[guildId];
@@ -71,6 +83,12 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function isUnknownError(e, code) {
+  if (!e) return false;
+  if (e.code === code) return true;
+  return e.status === 404 && /unknown/i.test(String(e.message ?? ""));
+}
+
 const FULL_INTENTS = [
   GatewayIntentBits.Guilds,
   GatewayIntentBits.GuildVoiceStates,
@@ -83,7 +101,15 @@ const SAFE_INTENTS = [
   GatewayIntentBits.GuildMessages,
 ];
 
-let client = null;
+function getConn(guildId) {
+  const conn = connections.get(guildId);
+  if (!conn) return null;
+  if (conn.state.status === VoiceConnectionStatus.Destroyed) {
+    connections.delete(guildId);
+    return null;
+  }
+  return conn;
+}
 
 function destroyConnection(guildId) {
   const conn = connections.get(guildId);
@@ -95,15 +121,50 @@ function destroyConnection(guildId) {
   } catch {}
 }
 
-async function doJoinGuild(guild, channelId) {
-  const channel = guild.channels.cache.get(channelId);
-  if (!channel || !channel.isVoiceBased()) {
-    console.log(`[voice:${guild.id}] channel ${channelId} hilang, stop auto rejoin`);
-    removeGuildState(guild.id);
-    destroyConnection(guild.id);
-    return false;
-  }
+function connectionStatus(guildId) {
+  return getConn(guildId)?.state?.status ?? null;
+}
 
+async function resolveVoiceChannel(guild, channelId) {
+  let channel = guild.channels.cache.get(channelId) ?? null;
+  if (!channel) {
+    try {
+      channel = await guild.channels.fetch(channelId);
+    } catch (e) {
+      console.log(`[voice:${guild.id}] channel ${channelId} belum kebaca`, e?.message ?? e);
+      return null;
+    }
+  }
+  return channel && channel.isVoiceBased() ? channel : null;
+}
+
+async function discordStillInChannel(guildId, channelId) {
+  const guild = client?.guilds?.cache?.get(guildId);
+  if (!guild) return null;
+  let me = guild.members.me;
+  if (!me) {
+    try {
+      me = await guild.members.fetchMe();
+    } catch {
+      return null;
+    }
+  }
+  const current = me?.voice?.channelId ?? null;
+  if (current === null) return false;
+  return current === channelId ? true : "other";
+}
+
+function attachListeners(connection, guildId) {
+  connection.on(VoiceConnectionStatus.Disconnected, (_, __, code) =>
+    onDisconnected(guildId, code)
+  );
+  connection.on(VoiceConnectionStatus.Destroyed, () => {
+    if (connections.get(guildId) === connection) connections.delete(guildId);
+  });
+  connection.on("error", (e) => console.error(`[voice:${guildId}] connection error`, e));
+}
+
+async function freshJoin(guild, channel) {
   destroyConnection(guild.id);
 
   let connection;
@@ -119,10 +180,7 @@ async function doJoinGuild(guild, channelId) {
     return false;
   }
 
-  connection.on(VoiceConnectionStatus.Disconnected, (_, __, code) =>
-    onDisconnected(guild.id, channel.id, code)
-  );
-  connection.on("error", (e) => console.error(`[voice:${guild.id}] connection error`, e));
+  attachListeners(connection, guild.id);
   connections.set(guild.id, connection);
 
   try {
@@ -133,29 +191,70 @@ async function doJoinGuild(guild, channelId) {
     return false;
   }
 
-  const prev = state[guild.id];
-  state[guild.id] = {
-    channelId: channel.id,
-    joinedAt: prev?.joinedAt ?? Date.now(),
-  };
-  saveState();
-  console.log(`[voice:${guild.id}] masuk ${channel.name}`);
+  setTarget(guild.id, channel.id);
+  console.log(`[voice:${guild.id}] join baru -> ${channel.name}`);
   return true;
 }
 
-function joinGuild(guild, channelId) {
+async function ensureConnected(guild, channelId) {
+  const channel = await resolveVoiceChannel(guild, channelId);
+  if (!channel) {
+    console.log(`[voice:${guild.id}] channel ${channelId} gak ada, stop`);
+    removeGuildState(guild.id);
+    destroyConnection(guild.id);
+    return false;
+  }
+
+  let conn = getConn(guild.id);
+  if (!conn) return freshJoin(guild, channel);
+
+  const status = conn.state.status;
+  const sameChannel = conn.joinConfig?.channelId === channel.id;
+
+  if (sameChannel && status === VoiceConnectionStatus.Ready) {
+    setTarget(guild.id, channel.id);
+    return true;
+  }
+
+  if (status === VoiceConnectionStatus.Connecting || status === VoiceConnectionStatus.Signalling) {
+    try {
+      await entersState(conn, VoiceConnectionStatus.Ready, READY_TIMEOUT_MS);
+      setTarget(guild.id, channel.id);
+      return true;
+    } catch {}
+    if (!getConn(guild.id)) return freshJoin(guild, channel);
+  }
+
+  conn = getConn(guild.id);
+  if (conn) {
+    const inChannel = await discordStillInChannel(guild.id, channel.id);
+    console.log(
+      `[voice:${guild.id}] reuse koneksi (discord_state=${inChannel === null ? "unknown" : inChannel})`
+    );
+    try {
+      conn.rejoin({ channelId: channel.id, selfDeaf: true, selfMute: false });
+      await entersState(conn, VoiceConnectionStatus.Ready, READY_TIMEOUT_MS);
+      setTarget(guild.id, channel.id);
+      console.log(`[voice:${guild.id}] rejoin tanpa destroy -> ${channel.name}`);
+      return true;
+    } catch (e) {
+      console.error(`[voice:${guild.id}] rejoin gagal, koneksi baru`, e?.message ?? e);
+    }
+  }
+
+  return freshJoin(guild, channel);
+}
+
+function connectGuild(guild, channelId) {
   const prev = joinChains.get(guild.id) ?? Promise.resolve();
-  const next = prev
-    .catch(() => {})
-    .then(() => doJoinGuild(guild, channelId));
+  const next = prev.catch(() => {}).then(() => ensureConnected(guild, channelId));
   joinChains.set(guild.id, next.catch(() => {}));
   return next;
 }
 
-function onDisconnected(guildId, channelId, code) {
-  const s = state[guildId];
-  if (!s || s.channelId !== channelId) return;
-  console.log(`[voice:${guildId}] terputus (code=${code ?? "?"}), auto rejoin...`);
+function onDisconnected(guildId, code) {
+  if (!state[guildId]) return;
+  console.log(`[voice:${guildId}] terputus (code=${code ?? "?"}), cek status dulu...`);
   scheduleRejoin(guildId);
 }
 
@@ -164,14 +263,25 @@ async function scheduleRejoin(guildId) {
   rejoining.add(guildId);
   try {
     while (state[guildId]) {
-      await sleep(REJOIN_DELAY_MS);
-      if (!state[guildId]) break;
-      const conn = connections.get(guildId);
-      if (conn && conn.state.status === VoiceConnectionStatus.Ready) break;
+      const status = connectionStatus(guildId);
+      if (status === VoiceConnectionStatus.Ready) return;
+
+      const s = state[guildId];
       const guild = client?.guilds?.cache?.get(guildId);
-      if (!guild) break;
-      console.log(`[voice:${guildId}] coba rejoin...`);
-      if (await joinGuild(guild, state[guildId].channelId)) break;
+      if (!guild) {
+        await sleep(REJOIN_DELAY_MS);
+        continue;
+      }
+
+      const inChannel = await discordStillInChannel(guildId, s.channelId);
+      if (inChannel === true) {
+        console.log(`[voice:${guildId}] discord masih anggap di channel, coba rejoin ringan`);
+      } else if (inChannel === false) {
+        console.log(`[voice:${guildId}] udah gak di channel, rejoin`);
+      }
+
+      if (await connectGuild(guild, s.channelId)) return;
+      await sleep(REJOIN_DELAY_MS);
     }
   } finally {
     rejoining.delete(guildId);
@@ -187,10 +297,8 @@ async function doJoin(guild, channel, reply) {
     await reply("Masuk voice channel dulu, baru jalanin command ini.");
     return;
   }
-  const prev = state[guild.id];
-  state[guild.id] = { channelId: channel.id, joinedAt: prev?.joinedAt ?? Date.now() };
-  saveState();
-  const ok = await joinGuild(guild, channel.id);
+  setTarget(guild.id, channel.id);
+  const ok = await connectGuild(guild, channel.id);
   if (ok) {
     await reply(`Masuk **${channel.name}**. Bot bakal stay, keluarin pake \`${PREFIX}leave\` atau \`/leave\`.`);
   } else {
@@ -224,8 +332,7 @@ async function doStatus(guild, reply) {
     await reply("Belum ada sesi voice. Jalanin `!join` atau `/join` dulu.");
     return;
   }
-  const conn = connections.get(guild.id);
-  const inVc = conn && conn.state.status === VoiceConnectionStatus.Ready;
+  const inVc = connectionStatus(guild.id) === VoiceConnectionStatus.Ready;
   await reply(
     `Status: **${inVc ? "stay di voice" : "reconnecting..."}**\n` +
       `Durasi: **${formatDuration(Date.now() - s.joinedAt)}**`
@@ -237,6 +344,28 @@ const SLASH_COMMANDS = [
   { name: "leave", description: "Keluarin bot dari voice channel" },
   { name: "status", description: "Cek durasi bot numpuk di voice" },
 ];
+
+async function restoreTargets(c) {
+  for (const guildId of Object.keys(state)) {
+    let guild = c.guilds.cache.get(guildId) ?? null;
+    if (!guild) {
+      try {
+        guild = await c.guilds.fetch(guildId);
+      } catch (e) {
+        if (isUnknownError(e, UNKNOWN_GUILD)) {
+          console.log(`[state] guild ${guildId} gak ada, buang dari state`);
+          removeGuildState(guildId);
+          continue;
+        }
+        console.log(`[state] guild ${guildId} belum kebaca, coba lagi nanti`);
+        scheduleRejoin(guildId);
+        continue;
+      }
+    }
+    if (!(await connectGuild(guild, state[guildId].channelId))) scheduleRejoin(guildId);
+  }
+  saveState();
+}
 
 function createClient(intents) {
   const c = new Client({ intents });
@@ -257,24 +386,7 @@ function createClient(intents) {
       console.error("Gagal daftar slash commands", e);
     }
 
-    for (const guildId of Object.keys(state)) {
-      let guild = c.guilds.cache.get(guildId);
-      if (!guild) {
-        try {
-          guild = await c.guilds.fetch(guildId);
-        } catch {
-          guild = null;
-        }
-      }
-      if (!guild) {
-        console.log(`[state] guild ${guildId} gak ketemu, buang dari state`);
-        removeGuildState(guildId);
-        continue;
-      }
-      const ok = await joinGuild(guild, state[guildId].channelId);
-      if (!ok) scheduleRejoin(guildId);
-    }
-    saveState();
+    await restoreTargets(c);
   });
 
   c.on("guildDelete", (guild) => {
@@ -296,12 +408,13 @@ function createClient(intents) {
   c.on("interactionCreate", async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     const reply = (t) => interaction.reply(t);
-    const channel = interaction.guild
-      ? interaction.guild.channels.cache.get(interaction.member?.voice?.channelId)
-      : null;
-    if (interaction.commandName === "join") await doJoin(interaction.guild, channel, reply);
-    else if (interaction.commandName === "leave") await doLeave(interaction.guild, reply);
-    else if (interaction.commandName === "status") await doStatus(interaction.guild, reply);
+    if (interaction.commandName === "join") {
+      await doJoin(interaction.guild, interaction.member?.voice?.channel, reply);
+    } else if (interaction.commandName === "leave") {
+      await doLeave(interaction.guild, reply);
+    } else if (interaction.commandName === "status") {
+      await doStatus(interaction.guild, reply);
+    }
   });
 
   c.on("voiceStateUpdate", (oldState, newState) => {
@@ -310,10 +423,9 @@ function createClient(intents) {
     const guildId = member.guild.id;
     const s = state[guildId];
     if (!s) return;
-    const newChannelId = newState.channelId;
-    if (newChannelId && newChannelId !== s.channelId) {
-      console.log(`[voice:${guildId}] bot dipindah ke ${newChannelId}, balik ke target`);
-      joinGuild(member.guild, s.channelId).then((ok) => {
+    if (newState.channelId && newState.channelId !== s.channelId) {
+      console.log(`[voice:${guildId}] bot dipindah, balikin ke target`);
+      connectGuild(member.guild, s.channelId).then((ok) => {
         if (!ok) scheduleRejoin(guildId);
       });
     }
@@ -351,10 +463,6 @@ function shutdown(signal) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
-process.on("uncaughtException", (e) => {
-  console.error("uncaughtException", e);
-  saveState();
-  process.exit(1);
-});
+process.on("uncaughtException", (e) => console.error("uncaughtException", e));
 
 start(FULL_INTENTS);
