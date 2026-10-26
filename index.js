@@ -1,7 +1,20 @@
 require("dotenv").config();
 const fs = require("node:fs");
 const path = require("node:path");
-const { Client, GatewayIntentBits, REST, Routes } = require("discord.js");
+const {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  PermissionsBitField,
+  ChannelType,
+  OverwriteType,
+  ApplicationCommandOptionType,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} = require("discord.js");
 const {
   joinVoiceChannel,
   entersState,
@@ -83,6 +96,20 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function safeSend(send) {
+  return async (t) => {
+    try {
+      await send(t);
+    } catch (e) {
+      console.log(`[reply] gagal kirim: ${e?.message ?? e}`);
+    }
+  };
+}
+
+function targetMatches(guildId, channelId) {
+  return state[guildId] && state[guildId].channelId === channelId;
+}
+
 function isUnknownError(e, code) {
   if (!e) return false;
   if (e.code === code) return true;
@@ -101,14 +128,267 @@ const SAFE_INTENTS = [
   GatewayIntentBits.GuildMessages,
 ];
 
-function getConn(guildId) {
-  const conn = connections.get(guildId);
-  if (!conn) return null;
-  if (conn.state.status === VoiceConnectionStatus.Destroyed) {
-    connections.delete(guildId);
-    return null;
+const VOICE_CONNECT_ALLOW = [
+  PermissionsBitField.Flags.ViewChannel,
+  PermissionsBitField.Flags.Connect,
+  PermissionsBitField.Flags.Speak,
+  PermissionsBitField.Flags.SendMessages,
+];
+const TEXT_ALLOW = [
+  PermissionsBitField.Flags.ViewChannel,
+  PermissionsBitField.Flags.SendMessages,
+  PermissionsBitField.Flags.ReadMessageHistory,
+  PermissionsBitField.Flags.EmbedLinks,
+  PermissionsBitField.Flags.AttachFiles,
+];
+
+const PV_CATEGORY_NAME = "Fixed Private Generated";
+const pvCategories = new Map();
+
+async function getPvCategory(guild) {
+  const cachedId = pvCategories.get(guild.id);
+  if (cachedId) {
+    const live = guild.channels.cache.get(cachedId);
+    if (live && live.type === ChannelType.GuildCategory) return live;
+    pvCategories.delete(guild.id);
   }
-  return conn;
+  let cat = guild.channels.cache.find(
+    (chan) =>
+      chan.type === ChannelType.GuildCategory &&
+      chan.name.toLowerCase() === PV_CATEGORY_NAME.toLowerCase()
+  );
+  if (!cat) {
+    const overwrites = [
+      {
+        id: guild.roles.everyone.id,
+        type: OverwriteType.Role,
+        deny: [PermissionsBitField.Flags.ViewChannel],
+      },
+    ];
+    if (client?.user?.id) {
+      overwrites.push({
+        id: client.user.id,
+        type: OverwriteType.Member,
+        allow: [
+          PermissionsBitField.Flags.ViewChannel,
+          PermissionsBitField.Flags.ManageChannels,
+        ],
+      });
+    }
+    try {
+      cat = await guild.channels.create({
+        name: PV_CATEGORY_NAME,
+        type: ChannelType.GuildCategory,
+        permissionOverwrites: overwrites,
+        reason: `kategori khusus channel private (${PV_CATEGORY_NAME})`,
+      });
+      console.log(`[pv:${guild.id}] kategori "${PV_CATEGORY_NAME}" kebikin ${cat.id}`);
+    } catch (e) {
+      console.error(`[pv:${guild.id}] gagal bikin kategori, fallback tanpa kategori`, e?.message ?? e);
+      return null;
+    }
+  }
+  pvCategories.set(guild.id, cat.id);
+  return cat;
+}
+
+function parseMemberTags(text) {
+  const ids = [];
+  const re = /<@!?(\d+)>/g;
+  let m;
+  while ((m = re.exec(text ?? ""))) ids.push(m[1]);
+  return [...new Set(ids)];
+}
+
+async function handleCreatePv(guild, creatorId, judulRaw, memberTags, tipe, reply) {
+  const judul = String(judulRaw ?? "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[\r\n]+/g, " ")
+    .slice(0, 100);
+  if (!judul) {
+    await reply("Judulnya kosong woy.");
+    return;
+  }
+  const isVoice = tipe === "voice";
+  if (guild.channels.cache.size >= 500) {
+    await reply("Server udah mentok batas 500 channel, masih gak bisa bikin.");
+    return;
+  }
+
+  const tagText = String(memberTags ?? "");
+  const rawIds = parseMemberTags(tagText);
+  const noTag = tagText.replace(/<@!?\d+>/g, "").trim();
+  if (noTag) {
+    await reply("Param `member` harus format tag, contoh: @budi @ani. Teks gak dianggep.");
+    return;
+  }
+
+  const memberIds = [];
+  for (const id of rawIds) {
+    try {
+      await guild.members.fetch(id);
+      memberIds.push(id);
+    } catch {
+      console.log(`[pv:${guild.id}] member ${id} gak ada di guild, skip`);
+    }
+  }
+  const uniqueNames = [...new Set([creatorId, client?.user?.id, ...memberIds])].filter(Boolean);
+
+  const overwrites = [
+    {
+      id: guild.roles.everyone.id,
+      type: OverwriteType.Role,
+      deny: isVoice
+        ? [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.Connect]
+        : [PermissionsBitField.Flags.ViewChannel],
+    },
+    ...uniqueNames.map((id) => ({
+      id,
+      type: OverwriteType.Member,
+      allow: [...(isVoice ? VOICE_CONNECT_ALLOW : TEXT_ALLOW)],
+    })),
+  ];
+
+  try {
+    const category = await getPvCategory(guild);
+    const channel = await guild.channels.create({
+      name: judul,
+      type: isVoice ? ChannelType.GuildVoice : ChannelType.GuildText,
+      parent: category ? category.id : undefined,
+      permissionOverwrites: overwrites,
+      reason: `private ${isVoice ? "voice" : "chat"} ${judul}`,
+    });
+    await reply(
+      `Private ${isVoice ? "voice" : "chat"} udah jadi: ${channel}` +
+        (category ? `\nNonggonya di kategori **${category.name}**.` : "") +
+        `\nYang bisa masuk: <@${creatorId}>${memberIds.length ? " plus " + memberIds.map((i) => `<@${i}>`).join(" ") : ""}\n` +
+        `Hapusnya: \`/delpv\` nomor channel ini.`
+    );
+  } catch (e) {
+    console.error(`[pv:${guild.id}] gagal bikin channel`, e);
+    await reply(`Gagal bikin channel: ${e?.message ?? e}`);
+  }
+}
+
+function canManagePv(member, channel) {
+  if (member?.permissions?.has?.(PermissionsBitField.Flags.ManageChannels)) return true;
+  const ow = channel?.permissionOverwrites?.cache?.get(member.id);
+  return !!ow && ow.allow.has(PermissionsBitField.Flags.ViewChannel);
+}
+
+async function handleDelPv(guild, member, channel, reply) {
+  if (!channel || typeof channel.isVoiceBased !== "function") {
+    await reply("Perlu channel yang mau dihapus, contoh: `/delpv channel:#namanya`.");
+    return;
+  }
+  try {
+    if (!canManagePv(member, channel)) {
+      await reply("Lu gak ada akses buat hapus ini channel.");
+      return;
+    }
+    const nama = channel.name;
+    const parentId = channel.parentId;
+    await channel.delete(`delpv oleh ${member.id}`);
+
+    let catNote = "";
+    if (parentId) {
+      const cat = guild.channels.cache.get(parentId);
+      if (
+        cat &&
+        cat.type === ChannelType.GuildCategory &&
+        cat.name.toLowerCase() === PV_CATEGORY_NAME.toLowerCase() &&
+        cat.children.cache.size === 0
+      ) {
+        try {
+          pvCategories.delete(guild.id);
+          await cat.delete(`kosong, auto-cleanup ${member.id}`);
+          catNote = " Kategorinya ikut dibersihin karena udah kosong.";
+        } catch (e) {
+          console.log(`[pv:${guild.id}] kategori gak bisa auto-dihapus`, e?.message ?? e);
+        }
+      }
+    }
+    await reply(`Private channel **${nama}** udah dihapus.${catNote}`);
+  } catch (e) {
+    console.error(`[pv:${guild.id}] gagal hapus`, e);
+    await reply(`Gagal hapus channel: ${e?.message ?? e}`);
+  }
+}
+
+const HELP_PAGES = {
+  jam: {
+    label: "Numpuk Jam",
+    color: 0xf1c40f,
+    title: "Numpuk Jam",
+    description: "Bot didesain biar jam numpuknya gak reset — reconnect tanpa lepas channel, kena kick buat sendiri.",
+    fields: [
+      { name: "`/join` — `!join`", value: "Masukin bot ke VC yang ada lu. Stay sampai di-leave." },
+      { name: "`/status`", value: "Cek durasi numpuk + status koneksi." },
+      { name: "`/leave` — `!leave`", value: "Bot keluar, jam direset." },
+    ],
+  },
+  pv: {
+    label: "Private Room",
+    color: 0x9b59b6,
+    title: "Private room",
+    description: "Room privat — cuma lu + yang di-tag bisa lihat & masuk. Nongol di kategori `Fixed Private Generated`.",
+    fields: [
+      {
+        name: "`/pv judul:` `member:` `tipe:`",
+        value: "`judul` wajib, `member` tag: `@budi @ani`, `tipe`: `chat` / `voice` (default `chat`).\nContoh: `/pv judul:Lobby @budi @ani voice`",
+      },
+      { name: "`!pv` — `!createprivate` / `!cp`", value: "Versi prefix. Contoh: `!pv Lobby @budi @ani voice`" },
+      {
+        name: "`/delpv channel:` — `!delpv`",
+        value: "Hapus room. Yang boleh: pembuat, member di-tag, atau admin `Manage Channels`.",
+      },
+    ],
+  },
+};
+
+function helpPageData(page) {
+  if (page !== "semua" && HELP_PAGES[page]) return HELP_PAGES[page];
+  return {
+    color: 0x2ecc71,
+    title: "Semua perintah",
+    description: "Semua yang bisa bot ini. Pencet tombol di bawah buat fokus ke satu kategori.",
+    fields: [
+      ...HELP_PAGES.jam.fields,
+      ...HELP_PAGES.pv.fields,
+    ],
+  };
+}
+
+function buildHelpPayload(page = "semua") {
+  const data = helpPageData(page);
+  const embed = new EmbedBuilder()
+    .setColor(data.color)
+    .setTitle(data.title)
+    .setDescription(data.description)
+    .setFooter({ text: "Tombol di bawah buat ganti halaman" });
+  if (Array.isArray(data.fields) && data.fields.length) embed.addFields(data.fields);
+  const avatar = client?.user?.displayAvatarURL?.();
+  if (avatar) embed.setThumbnail(avatar);
+
+  const row = new ActionRowBuilder().addComponents(
+    ["jam", "pv", "semua"].map((key) => {
+      const btn = new ButtonBuilder()
+        .setCustomId(`help:${key}`)
+        .setLabel(key === "semua" ? "Semua" : HELP_PAGES[key].label)
+        .setStyle(key === page ? ButtonStyle.Primary : ButtonStyle.Secondary);
+      return btn;
+    })
+  );
+  return { embeds: [embed], components: [row] };
+}
+
+async function handleHelp(reply, page = "semua") {
+  await reply(buildHelpPayload(page));
+}
+
+function getConn(guildId) {
+  return connections.get(guildId) ?? null;
 }
 
 function destroyConnection(guildId) {
@@ -165,6 +445,10 @@ function attachListeners(connection, guildId) {
 }
 
 async function freshJoin(guild, channel) {
+  if (state[guild.id] && state[guild.id].channelId !== channel.id) {
+    console.log(`[voice:${guild.id}] target udah berubah, batalkan join lama`);
+    return false;
+  }
   destroyConnection(guild.id);
 
   let connection;
@@ -191,6 +475,11 @@ async function freshJoin(guild, channel) {
     return false;
   }
 
+  if (!targetMatches(guild.id, channel.id)) {
+    console.log(`[voice:${guild.id}] target keganti pas join, keluar lagi`);
+    destroyConnection(guild.id);
+    return false;
+  }
   setTarget(guild.id, channel.id);
   console.log(`[voice:${guild.id}] join baru -> ${channel.name}`);
   return true;
@@ -200,40 +489,51 @@ async function ensureConnected(guild, channelId) {
   const channel = await resolveVoiceChannel(guild, channelId);
   if (!channel) {
     console.log(`[voice:${guild.id}] channel ${channelId} gak ada, stop`);
-    removeGuildState(guild.id);
+    if (targetMatches(guild.id, channelId)) removeGuildState(guild.id);
     destroyConnection(guild.id);
     return false;
   }
-
-  let conn = getConn(guild.id);
-  if (!conn) return freshJoin(guild, channel);
-
-  const status = conn.state.status;
-  const sameChannel = conn.joinConfig?.channelId === channel.id;
-
-  if (sameChannel && status === VoiceConnectionStatus.Ready) {
-    setTarget(guild.id, channel.id);
-    return true;
+  if (state[guild.id] && state[guild.id].channelId !== channelId) {
+    console.log(`[voice:${guild.id}] target udah berubah, skip join lama`);
+    return false;
   }
 
-  if (status === VoiceConnectionStatus.Connecting || status === VoiceConnectionStatus.Signalling) {
+  const former = getConn(guild.id);
+  if (
+    former &&
+    (former.state.status === VoiceConnectionStatus.Connecting ||
+      former.state.status === VoiceConnectionStatus.Signalling)
+  ) {
     try {
-      await entersState(conn, VoiceConnectionStatus.Ready, READY_TIMEOUT_MS);
-      setTarget(guild.id, channel.id);
-      return true;
+      await entersState(former, VoiceConnectionStatus.Ready, READY_TIMEOUT_MS);
     } catch {}
     if (!getConn(guild.id)) return freshJoin(guild, channel);
   }
 
-  conn = getConn(guild.id);
-  if (conn) {
-    const inChannel = await discordStillInChannel(guild.id, channel.id);
-    console.log(
-      `[voice:${guild.id}] reuse koneksi (discord_state=${inChannel === null ? "unknown" : inChannel})`
-    );
+  const actual = await discordStillInChannel(guild.id, channel.id);
+  const conn = getConn(guild.id);
+
+  if (actual === true && conn?.state.status === VoiceConnectionStatus.Ready) {
+    if (targetMatches(guild.id, channel.id)) setTarget(guild.id, channel.id);
+    return true;
+  }
+
+  if (conn && conn.state.status !== VoiceConnectionStatus.Destroyed) {
+    const reason =
+      actual === false
+        ? "udah gak di channel menurut discord"
+        : actual === "other"
+          ? "dipindah ke channel laen"
+          : "status koneksi gak ready";
+    console.log(`[voice:${guild.id}] ${reason}, rejoin ke ${channel.name}`);
     try {
       conn.rejoin({ channelId: channel.id, selfDeaf: true, selfMute: false });
       await entersState(conn, VoiceConnectionStatus.Ready, READY_TIMEOUT_MS);
+      if (!targetMatches(guild.id, channel.id)) {
+        console.log(`[voice:${guild.id}] target keganti pas rejoin, keluar lagi`);
+        destroyConnection(guild.id);
+        return false;
+      }
       setTarget(guild.id, channel.id);
       console.log(`[voice:${guild.id}] rejoin tanpa destroy -> ${channel.name}`);
       return true;
@@ -340,9 +640,91 @@ async function doStatus(guild, reply) {
 }
 
 const SLASH_COMMANDS = [
-  { name: "join", description: "Masuk ke voice channel kamu dan stay" },
-  { name: "leave", description: "Keluarin bot dari voice channel" },
-  { name: "status", description: "Cek durasi bot numpuk di voice" },
+  {
+    name: "join",
+    description: "Masuk ke voice channel kamu dan stay",
+  },
+  {
+    name: "leave",
+    description: "Keluarin bot dari voice channel",
+  },
+  {
+    name: "status",
+    description: "Cek durasi bot numpuk di voice",
+  },
+  {
+    name: "createprivate",
+    description: "Bikin private chat/voice room buat lomba, cuman yang di-tag aja",
+    options: [
+      {
+        name: "judul",
+        description: "Nama channel",
+        type: ApplicationCommandOptionType.String,
+        required: true,
+      },
+      {
+        name: "member",
+        description: "Tag member, contoh: @budi @ani (boleh kosong)",
+        type: ApplicationCommandOptionType.String,
+        required: false,
+      },
+      {
+        name: "tipe",
+        description: "Jenis room",
+        type: ApplicationCommandOptionType.String,
+        required: false,
+        choices: [
+          { name: "chat", value: "chat" },
+          { name: "voice", value: "voice" },
+        ],
+      },
+    ],
+  },
+  {
+    name: "pv",
+    description: "Alias /createprivate — bikin private chat/voice room",
+    options: [
+      {
+        name: "judul",
+        description: "Nama channel",
+        type: ApplicationCommandOptionType.String,
+        required: true,
+      },
+      {
+        name: "member",
+        description: "Tag member, contoh: @budi @ani (boleh kosong)",
+        type: ApplicationCommandOptionType.String,
+        required: false,
+      },
+      {
+        name: "tipe",
+        description: "Jenis room",
+        type: ApplicationCommandOptionType.String,
+        required: false,
+        choices: [
+          { name: "chat", value: "chat" },
+          { name: "voice", value: "voice" },
+        ],
+      },
+    ],
+  },
+  {
+    name: "delpv",
+    description: "Hapus private channel yang gak dipake lagi",
+    options: [
+      {
+        name: "channel",
+        description: "Channel yang mau dihapus",
+        type: ApplicationCommandOptionType.Channel,
+        channel_types: [ChannelType.GuildText, ChannelType.GuildVoice],
+        required: true,
+      },
+    ],
+  },
+  {
+    name: "help",
+    description: "Info semua perintah bot",
+  },
 ];
 
 async function restoreTargets(c) {
@@ -375,7 +757,7 @@ function createClient(intents) {
 
   c.once("clientReady", async () => {
     console.log(`Logged in sebagai ${c.user.tag} (prefix: ${intents === SAFE_INTENTS ? "OFF, slash-only" : "ON"})`);
-    c.user.setActivity(`/join buat numpuk jam`);
+    c.user.setActivity("/help buat info • numpuk jam di voice");
 
     try {
       await new REST()
@@ -397,23 +779,86 @@ function createClient(intents) {
   c.on("messageCreate", async (msg) => {
     if (msg.author.bot || !msg.inGuild() || !msg.member) return;
     if (!msg.content.startsWith(PREFIX)) return;
-    const [cmd] = msg.content.slice(PREFIX.length).trim().split(/\s+/);
-    const name = (cmd || "").toLowerCase();
-    const reply = (t) => msg.reply(t);
+    const rest = msg.content.slice(PREFIX.length).trim();
+    if (!rest) return;
+    const name = (rest.split(/\s+/)[0] || "").toLowerCase();
+    const raw = rest.slice(name.length).trim();
+    const reply = safeSend((t) => msg.reply(t));
+
     if (name === "join") await doJoin(msg.guild, msg.member.voice?.channel, reply);
     else if (name === "leave") await doLeave(msg.guild, reply);
     else if (name === "status") await doStatus(msg.guild, reply);
+    else if (name === "help") await handleHelp(reply);
+    else if (name === "pv" || name === "createprivate" || name === "cp") {
+      const { judul, memberIds, tipe } = parsePvArgs(raw);
+      await handleCreatePv(msg.guild, msg.author.id, judul, memberIds.map((i) => `<@${i}>`).join(" "), tipe, reply);
+    } else if (name === "delpv") {
+      const m = /<#(\d+)>/g.exec(raw);
+      const id = m?.[1] ?? /^\d+$/.exec(raw)?.[0];
+      const channel = id ? msg.guild.channels.cache.get(id) : null;
+      await handleDelPv(msg.guild, msg.member, channel, reply);
+    }
   });
 
   c.on("interactionCreate", async (interaction) => {
+    if (interaction.isButton() && interaction.customId?.startsWith("help:")) {
+      const raw = interaction.customId.slice("help:".length);
+      const page = HELP_PAGES[raw] ? raw : "semua";
+      try {
+        await interaction.update(buildHelpPayload(page));
+      } catch (e) {
+        console.log(`[help] gagal ganti halaman: ${e?.message ?? e}`);
+      }
+      return;
+    }
     if (!interaction.isChatInputCommand()) return;
-    const reply = (t) => interaction.reply(t);
+    const slow = ["join", "createprivate", "pv", "delpv"].includes(interaction.commandName);
+    let send;
+    if (slow) {
+      try {
+        await interaction.deferReply();
+      } catch (e) {
+        console.error("[reply] defer gagal", e);
+        return;
+      }
+      send = (t) => interaction.editReply(t);
+    } else {
+      send = (t) => interaction.reply(t);
+    }
+    const reply = safeSend(send);
+
     if (interaction.commandName === "join") {
       await doJoin(interaction.guild, interaction.member?.voice?.channel, reply);
     } else if (interaction.commandName === "leave") {
       await doLeave(interaction.guild, reply);
     } else if (interaction.commandName === "status") {
       await doStatus(interaction.guild, reply);
+    } else if (interaction.commandName === "help") {
+      await handleHelp(reply);
+    } else if (interaction.commandName === "createprivate" || interaction.commandName === "pv") {
+      if (!interaction.guild) {
+        await reply("Command ini cuma bisa dipake di dalam server.");
+        return;
+      }
+      await handleCreatePv(
+        interaction.guild,
+        interaction.user.id,
+        interaction.options.getString("judul"),
+        interaction.options.getString("member", false) ?? "",
+        interaction.options.getString("tipe", false) ?? "chat",
+        reply
+      );
+    } else if (interaction.commandName === "delpv") {
+      if (!interaction.guild) {
+        await reply("Command ini cuma bisa dipake di dalam server.");
+        return;
+      }
+      await handleDelPv(
+        interaction.guild,
+        interaction.member,
+        interaction.options.getChannel("channel", false),
+        reply
+      );
     }
   });
 
@@ -432,6 +877,19 @@ function createClient(intents) {
   });
 
   return c;
+}
+
+function parsePvArgs(raw) {
+  let text = raw;
+  let tipe = "chat";
+  const mTipe = /\b(chat|voice)\s*$/i.exec(text);
+  if (mTipe) {
+    tipe = mTipe[1].toLowerCase();
+    text = text.slice(0, mTipe.index);
+  }
+  const memberIds = parseMemberTags(text);
+  const judul = text.replace(/<@!?\d+>/g, "").trim().replace(/\s+/g, " ");
+  return { judul, memberIds, tipe };
 }
 
 function start(intents) {
