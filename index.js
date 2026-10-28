@@ -24,6 +24,7 @@ const {
 const TOKEN = process.env.DISCORD_TOKEN;
 const PREFIX = "!";
 const STATE_FILE = path.join(__dirname, "state.json");
+const PV_FILE = path.join(__dirname, "pv.json");
 const READY_TIMEOUT_MS = 20000;
 const REJOIN_DELAY_MS = 5000;
 const UNKNOWN_GUILD = 10004;
@@ -34,6 +35,7 @@ if (!TOKEN) {
 }
 
 const state = loadState();
+const pvOwners = loadPvOwners();
 const connections = new Map();
 const rejoining = new Set();
 const joinChains = new Map();
@@ -66,6 +68,36 @@ function saveState() {
     fs.renameSync(tmp, STATE_FILE);
   } catch (e) {
     console.error("[state] gagal simpan state.json", e);
+  }
+}
+
+function loadPvOwners() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(PV_FILE, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const clean = {};
+    for (const [channelId, rec] of Object.entries(parsed)) {
+      if (rec && typeof rec.guildId === "string" && typeof rec.creatorId === "string") {
+        clean[channelId] = {
+          guildId: rec.guildId,
+          creatorId: rec.creatorId,
+          createdAt: Number.isFinite(rec.createdAt) ? rec.createdAt : Date.now(),
+        };
+      }
+    }
+    return clean;
+  } catch {
+    return {};
+  }
+}
+
+function savePvOwners() {
+  try {
+    const tmp = `${PV_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(pvOwners, null, 2));
+    fs.renameSync(tmp, PV_FILE);
+  } catch (e) {
+    console.error("[pv] gagal simpan pv.json", e);
   }
 }
 
@@ -250,15 +282,23 @@ async function handleCreatePv(guild, creatorId, judulRaw, memberTags, tipe, repl
     })),
   ];
 
-  try {
-    const category = await getPvCategory(guild);
-    const channel = await guild.channels.create({
-      name: judul,
-      type: isVoice ? ChannelType.GuildVoice : ChannelType.GuildText,
-      parent: category ? category.id : undefined,
-      permissionOverwrites: overwrites,
-      reason: `private ${isVoice ? "voice" : "chat"} ${judul}`,
-    });
+    try {
+      const category = await getPvCategory(guild);
+      const channel = await guild.channels.create({
+        name: judul,
+        type: isVoice ? ChannelType.GuildVoice : ChannelType.GuildText,
+        parent: category ? category.id : undefined,
+        permissionOverwrites: overwrites,
+        reason: `private ${isVoice ? "voice" : "chat"} ${judul}`,
+      });
+      if (channel) {
+        pvOwners[channel.id] = {
+          guildId: guild.id,
+          creatorId,
+          createdAt: Date.now(),
+        };
+        savePvOwners();
+      }
     await reply(
       `Private ${isVoice ? "voice" : "chat"} udah jadi: ${channel}` +
         (category ? `\nNonggonya di kategori **${category.name}**.` : "") +
@@ -271,10 +311,9 @@ async function handleCreatePv(guild, creatorId, judulRaw, memberTags, tipe, repl
   }
 }
 
-function canManagePv(member, channel) {
+function canDeletePv(member, record) {
   if (member?.permissions?.has?.(PermissionsBitField.Flags.ManageChannels)) return true;
-  const ow = channel?.permissionOverwrites?.cache?.get(member.id);
-  return !!ow && ow.allow.has(PermissionsBitField.Flags.ViewChannel);
+  return !!record && record.creatorId === member.id;
 }
 
 async function handleDelPv(guild, member, channel, reply) {
@@ -283,37 +322,49 @@ async function handleDelPv(guild, member, channel, reply) {
     return;
   }
   try {
-    if (!canManagePv(member, channel)) {
-      await reply("Lu gak ada akses buat hapus ini channel.");
+    const record = pvOwners[channel.id];
+    if (!record) {
+      await reply("Channel itu bukan private room yang dibikin bot ini.");
+      return;
+    }
+    if (!member?.id || !canDeletePv(member, record)) {
+      await reply(
+        `Lu gak bisa hapus ini. Yang boleh cuma pembuatnya (<@${record.creatorId}>) atau admin server.`
+      );
       return;
     }
     const nama = channel.name;
     const parentId = channel.parentId;
     await channel.delete(`delpv oleh ${member.id}`);
+    delete pvOwners[channel.id];
+    savePvOwners();
 
     let catNote = "";
-    if (parentId) {
-      const cat = guild.channels.cache.get(parentId);
-      if (
-        cat &&
-        cat.type === ChannelType.GuildCategory &&
-        cat.name.toLowerCase() === PV_CATEGORY_NAME.toLowerCase() &&
-        cat.children.cache.size === 0
-      ) {
-        try {
-          pvCategories.delete(guild.id);
-          await cat.delete(`kosong, auto-cleanup ${member.id}`);
-          catNote = " Kategorinya ikut dibersihin karena udah kosong.";
-        } catch (e) {
-          console.log(`[pv:${guild.id}] kategori gak bisa auto-dihapus`, e?.message ?? e);
-        }
-      }
-    }
-    await reply(`Private channel **${nama}** udah dihapus.${catNote}`);
+    if (parentId) catNote = await maybeCleanupPvCategory(guild, parentId);
+    await reply(`Private room **${nama}** udah dihapus.${catNote}`);
   } catch (e) {
     console.error(`[pv:${guild.id}] gagal hapus`, e);
     await reply(`Gagal hapus channel: ${e?.message ?? e}`);
   }
+}
+
+async function maybeCleanupPvCategory(guild, parentId) {
+  const cat = guild.channels.cache.get(parentId);
+  if (
+    cat &&
+    cat.type === ChannelType.GuildCategory &&
+    cat.name.toLowerCase() === PV_CATEGORY_NAME.toLowerCase() &&
+    cat.children.cache.size === 0
+  ) {
+    try {
+      pvCategories.delete(guild.id);
+      await cat.delete("private room terakhir dihapus, kategori kosong");
+      return " Kategorinya ikut dibersihin karena udah kosong.";
+    } catch (e) {
+      console.log(`[pv:${guild.id}] kategori gak bisa auto-dihapus`, e?.message ?? e);
+    }
+  }
+  return "";
 }
 
 const HELP_PAGES = {
@@ -341,7 +392,7 @@ const HELP_PAGES = {
       { name: "`!pv` — `!createprivate` / `!cp`", value: "Versi prefix. Contoh: `!pv Lobby @budi @ani voice`" },
       {
         name: "`/delpv channel:` — `!delpv`",
-        value: "Hapus room. Yang boleh: pembuat, member di-tag, atau admin `Manage Channels`.",
+        value: "Hapus room buatan bot ini. Yang boleh: pembuatnya atau admin server `Manage Channels`.",
       },
     ],
   },
@@ -774,6 +825,37 @@ function createClient(intents) {
   c.on("guildDelete", (guild) => {
     removeGuildState(guild.id);
     destroyConnection(guild.id);
+    let dirty = false;
+    for (const channelId of Object.keys(pvOwners)) {
+      if (pvOwners[channelId].guildId === guild.id) {
+        delete pvOwners[channelId];
+        dirty = true;
+      }
+    }
+    if (dirty) savePvOwners();
+  });
+
+  c.on("channelDelete", async (channel) => {
+    const wasOwned = !!pvOwners[channel?.id];
+    if (!wasOwned && channel?.parentId && channel.parentId !== channel.id) {
+      const guard = channel;
+      const cat = channel.guild?.channels?.cache?.get(guard.parentId);
+      if (
+        cat &&
+        cat.type === ChannelType.GuildCategory &&
+        cat.name.toLowerCase() === PV_CATEGORY_NAME.toLowerCase() &&
+        cat.children.cache.size === 0
+      ) {
+        try {
+          await cat.delete("isi kategori kehapus semua, bersihin");
+        } catch {}
+      }
+      return;
+    }
+    if (wasOwned) {
+      delete pvOwners[channel.id];
+      savePvOwners();
+    }
   });
 
   c.on("messageCreate", async (msg) => {
