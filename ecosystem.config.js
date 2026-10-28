@@ -7,7 +7,7 @@ module.exports = {
     {
       name: "bot-voice-keeper",
       script: "index.js",
-      interpreter: "node",
+      interpreter: "bun",
       cwd: __dirname,
       exp_backoff_restart_delay: 100,
       watch: false,
